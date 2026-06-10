@@ -3,9 +3,8 @@
 *다른 언어로 보기: [English](README.md)*
 
 [Depth-Anything-3](https://github.com/ByteDance-Seed/Depth-Anything-3)를 TensorRT로
-가속한 단안(monocular) 깊이 추정 파이프라인입니다. `DEIMv2-FastTracker-TensorRT`와
-동일한 구조로, `export/` 폴더에서 체크포인트를 `pth → onnx → trt`로 변환하고
-`depth_estimation.py`로 폴더 안의 이미지들에 대해 추론을 실행합니다.
+가속한 단안(monocular) 깊이 추정 파이프라인입니다. `export/` 폴더에서 체크포인트를
+`pth → onnx → trt`로 변환하고 `depth_estimation.py`로 폴더 안의 이미지들에 대해 추론을 실행합니다.
 
 - **깊이 추정**: Depth-Anything-3를 TensorRT 엔진으로 변환해 추론합니다.
 - **Metric & 상대 깊이**: metric 모델(미터 단위 깊이)과 상대(affine-invariant) 모델을 모두 지원합니다.

@@ -3,9 +3,8 @@
 *Read this in other languages: [한국어](README_KR.md)*
 
 Monocular depth estimation with [Depth-Anything-3](https://github.com/ByteDance-Seed/Depth-Anything-3)
-accelerated by TensorRT. Mirrors the structure of `DEIMv2-FastTracker-TensorRT`:
-an `export/` folder converts a checkpoint `pth → onnx → trt`, and
-`depth_estimation.py` runs inference over a folder of images.
+accelerated by TensorRT. An `export/` folder converts a checkpoint
+`pth → onnx → trt`, and `depth_estimation.py` runs inference over a folder of images.
 
 - **Depth**: Depth-Anything-3 is converted to a TensorRT engine for inference.
 - **Metric & relative**: both metric models (depth in metres) and relative
