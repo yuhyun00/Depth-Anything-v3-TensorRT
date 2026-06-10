@@ -25,6 +25,7 @@ Example:
 """
 
 import argparse
+import math
 import os
 
 import torch
@@ -43,6 +44,47 @@ def _cartesian_prod(*tensors: torch.Tensor) -> torch.Tensor:
 
 
 torch.cartesian_prod = _cartesian_prod
+
+
+# The DINOv2 backbone bakes its position encodings at the trace resolution, so the
+# engine would reject any other input size. Re-express both so they follow the
+# dynamic input H/W at run time.
+def _patch_dynamic_pos_encoding():
+    from depth_anything_3.model.dinov2.layers.rope import PositionGetter
+    from depth_anything_3.model.dinov2.vision_transformer import DinoVisionTransformer
+
+    def interpolate_pos_encoding(self, x, w, h):
+        # Interpolate pos_embed to the actual patch grid via `size` (from the
+        # dynamic H/W), not the constant scale_factor path that froze the size.
+        previous_dtype = x.dtype
+        N = self.pos_embed.shape[1] - 1
+        M = int(math.sqrt(N))  # fixed parameter -> safe to read as a constant
+        dim = x.shape[-1]
+        pos_embed = self.pos_embed.float()
+        class_pos_embed = pos_embed[:, 0]
+        patch_pos_embed = pos_embed[:, 1:].reshape(1, M, M, dim).permute(0, 3, 1, 2)
+        w0 = w // self.patch_size
+        h0 = h // self.patch_size
+        patch_pos_embed = nn.functional.interpolate(
+            patch_pos_embed, size=(w0, h0), mode="bicubic",
+            antialias=self.interpolate_antialias,
+        )
+        patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
+        return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1).to(previous_dtype)
+
+    def position_getter_call(self, batch_size, height, width, device):
+        # Recompute every call (skip the size-keyed cache) so the grid tracks the
+        # dynamic patch count instead of freezing at the trace size.
+        y_coords = torch.arange(height, device=device)
+        x_coords = torch.arange(width, device=device)
+        positions = torch.cartesian_prod(y_coords, x_coords)
+        return positions.view(1, height * width, 2).expand(batch_size, -1, -1).clone()
+
+    DinoVisionTransformer.interpolate_pos_encoding = interpolate_pos_encoding
+    PositionGetter.__call__ = position_getter_call
+
+
+_patch_dynamic_pos_encoding()
 
 
 # Per-family output tensor names. Keep in sync with depth_estimation.py.
