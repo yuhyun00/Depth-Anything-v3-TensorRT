@@ -1,27 +1,29 @@
 """
 Build a TensorRT engine (.engine) from a Depth-Anything-3 ONNX model.
 
-The exported graph has a single input ``images`` of shape ``(1, 3, H, W)`` where H
-and W are dynamic (the official pre-processing resizes the longest side to
-``process_res`` while preserving aspect ratio, so the two spatial dims vary per
-image). We therefore build an explicit-batch network with a single optimization
-profile that covers a range of spatial sizes; pick ``--opt-*`` to match the size
-you run most often (typically process_res x process_res).
+Input ``images`` is (1, 3, H, W) with dynamic H/W (both multiples of 14). Specify
+only the longest side via ``--res``; the engine accepts any HxW with both sides in
+``[14, res]`` and is tuned for ``(res, res)``. The inference script reads this back
+from the engine, so no input size is passed at run time.
 
-Both H and W must stay multiples of 14 (the DINO patch size).
+For external-data models (giant / nested), keep the ``<name>.onnx_data`` sidecar in
+the same folder as the ``.onnx``.
 
 Example:
     python3 onnx2trt.py --onnx da3metric_large.onnx --saveEngine da3metric_large.engine \
-        --fp16 --min 154 154 --opt 504 504 --max 504 504
+        --fp16 --res 504
 """
 
 import argparse
 
 import tensorrt as trt
 
+PATCH_SIZE = 14  # DINO patch size; every input side must be a multiple of this.
 
-def build_engine(onnx_path, engine_path, min_hw=(154, 154), opt_hw=(504, 504),
-                 max_hw=(504, 504), fp16=False, workspace_gb=8):
+
+def build_engine(onnx_path, engine_path, res=504, fp16=False, workspace_gb=8):
+    assert res % PATCH_SIZE == 0, f"res must be a multiple of {PATCH_SIZE}, got {res}"
+
     logger = trt.Logger(trt.Logger.INFO)
     trt.init_libnvinfer_plugins(logger, "")
 
@@ -31,14 +33,16 @@ def build_engine(onnx_path, engine_path, min_hw=(154, 154), opt_hw=(504, 504),
     )
     parser = trt.OnnxParser(network, logger)
 
-    with open(onnx_path, "rb") as f:
-        if not parser.parse(f.read()):
-            for i in range(parser.num_errors):
-                print(parser.get_error(i))
-            raise RuntimeError(f"Failed to parse ONNX: {onnx_path}")
+    # parse_from_file (not parse(bytes)) so external-data sidecars are resolved.
+    if not parser.parse_from_file(onnx_path):
+        for i in range(parser.num_errors):
+            print(parser.get_error(i))
+        raise RuntimeError(f"Failed to parse ONNX: {onnx_path}")
 
-    for hw in (min_hw, opt_hw, max_hw):
-        assert hw[0] % 14 == 0 and hw[1] % 14 == 0, f"H/W must be multiples of 14, got {hw}"
+    # Longest side <= res, any aspect ratio / orientation; opt = (res, res).
+    min_hw = (PATCH_SIZE, PATCH_SIZE)
+    opt_hw = (res, res)
+    max_hw = (res, res)
 
     config = builder.create_builder_config()
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_gb << 30)
@@ -49,7 +53,6 @@ def build_engine(onnx_path, engine_path, min_hw=(154, 154), opt_hw=(504, 504),
         else:
             print("FP16 requested but not supported on this platform; using FP32.")
 
-    # The input tensor is assumed to be the first network input named "images".
     input_name = network.get_input(0).name
     profile = builder.create_optimization_profile()
     profile.set_shape(
@@ -59,6 +62,7 @@ def build_engine(onnx_path, engine_path, min_hw=(154, 154), opt_hw=(504, 504),
         (1, 3, max_hw[0], max_hw[1]),
     )
     config.add_optimization_profile(profile)
+    print(f"Input profile: H/W in [{PATCH_SIZE}, {res}], opt ({res}x{res})")
 
     print(f"Building engine from {onnx_path} ... (this can take a while)")
     serialized = builder.build_serialized_network(network, config)
@@ -75,21 +79,16 @@ if __name__ == "__main__":
     parser.add_argument("--onnx", required=True, help="input ONNX path")
     parser.add_argument("--saveEngine", required=True, help="output .engine path")
     parser.add_argument("--fp16", action="store_true", help="enable FP16 precision")
-    parser.add_argument("--min", type=int, nargs=2, default=[154, 154], metavar=("H", "W"),
-                        help="min input H W (multiples of 14)")
-    parser.add_argument("--opt", type=int, nargs=2, default=[504, 504], metavar=("H", "W"),
-                        help="optimal input H W (multiples of 14)")
-    parser.add_argument("--max", type=int, nargs=2, default=[504, 504], metavar=("H", "W"),
-                        help="max input H W (multiples of 14)")
+    parser.add_argument("--res", type=int, default=504,
+                        help="longest input side (multiple of 14); the engine accepts any "
+                             "HxW with both sides in [14, res]")
     parser.add_argument("--workspace", type=int, default=8, help="workspace size in GiB")
     args = parser.parse_args()
 
     build_engine(
         args.onnx,
         args.saveEngine,
-        min_hw=tuple(args.min),
-        opt_hw=tuple(args.opt),
-        max_hw=tuple(args.max),
+        res=args.res,
         fp16=args.fp16,
         workspace_gb=args.workspace,
     )

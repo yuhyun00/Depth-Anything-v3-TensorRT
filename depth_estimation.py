@@ -1,26 +1,24 @@
 """
 Depth-Anything-3 (TensorRT) monocular depth-estimation pipeline.
 
-Pipeline:
-    RGB image -> preprocess (official Depth-Anything-3 InputProcessor) ->
-    TensorRT inference -> family-specific post-processing (sky handling, metric
-    scaling, nested least-squares alignment) -> depth map (+ confidence).
+Pipeline: RGB -> preprocess -> TensorRT inference -> family-specific
+post-processing (sky handling, metric scaling, nested alignment) -> depth (+ conf).
 
-The depth-estimation logic lives in the ``DepthAnythingV3`` class. Colorized
-visualization is a separate, standalone function. ``main()`` globs an input folder,
-runs the pipeline on each image, and saves the results.
-
-Model families (must match the engine built by export/pth2onnx.py):
+Model families (must match the exported engine):
     anyview  (DA3-SMALL/BASE/LARGE/GIANT)  -> relative (affine-invariant) depth
     metric   (DA3METRIC-LARGE)             -> metric depth (needs --focal)
     mono     (DA3MONO-LARGE)               -> relative monocular depth
     nested   (DA3NESTED-GIANT-LARGE)       -> metric depth (self-contained)
 
+The input size is read from the engine (longest side of its opt shape, set by
+``onnx2trt --res``), so there is no input-size flag: each image is resized with the
+longest side at that value, aspect preserved, each side a multiple of 14.
+
 Example:
     python3 depth_estimation.py \
         --input ./images --output ./results \
         --trt ./da3metric_large.engine --model-type metric \
-        --process-res 504 --focal 1200 --save-raw
+        --focal 1200 --save-raw
 """
 
 import argparse
@@ -61,6 +59,12 @@ class TRTInference(object):
         self.output_names = self._names(trt.TensorIOMode.OUTPUT)
         assert len(self.input_names) == 1, "expected a single image input"
 
+        # Accepted input-size range (min/max) and tuned size (opt) from the engine.
+        mn, opt, mx = self.engine.get_tensor_profile_shape(self.input_names[0], 0)
+        self.min_shape = tuple(int(d) for d in mn)  # (1, 3, Hmin, Wmin)
+        self.opt_shape = tuple(int(d) for d in opt)  # (1, 3, Hopt, Wopt)
+        self.max_shape = tuple(int(d) for d in mx)  # (1, 3, Hmax, Wmax)
+
     def _names(self, mode):
         names = []
         for name in self.engine:
@@ -93,7 +97,7 @@ class TRTInference(object):
 # Depth-Anything-3 pipeline.
 # --------------------------------------------------------------------------- #
 PATCH_SIZE = 14
-_METRIC_SCALE = 300.0  # metric_depth = focal * raw / 300  (official constant)
+_METRIC_SCALE = 300.0  # metric_depth = focal * raw / 300
 
 
 class DepthAnythingV3:
@@ -105,39 +109,46 @@ class DepthAnythingV3:
         is_metric  : bool, True when ``depth`` is in metres
     """
 
-    def __init__(self, engine_path, model_type, process_res=504,
+    def __init__(self, engine_path, model_type,
                  process_res_method="upper_bound_resize", device="cuda:0",
                  focal=None):
         assert model_type in {"anyview", "metric", "mono", "nested"}
         assert process_res_method in {"upper_bound_resize", "lower_bound_resize"}
         self.model_type = model_type
-        self.process_res = int(process_res)
         self.process_res_method = process_res_method
         self.device = device
         self.focal = focal  # focal length in pixels of the ORIGINAL image (metric model)
 
         self.model = TRTInference(engine_path, device=device)
-        # Identical to the official InputProcessor: ToTensor + ImageNet normalize.
+
+        # Input size comes from the engine: resize targets the longest opt side,
+        # clamped to the [min, max] range. Nothing is passed in by the caller.
+        self.min_h, self.min_w = self.model.min_shape[2], self.model.min_shape[3]
+        self.opt_h, self.opt_w = self.model.opt_shape[2], self.model.opt_shape[3]
+        self.max_h, self.max_w = self.model.max_shape[2], self.model.max_shape[3]
+        self.process_res = max(self.opt_h, self.opt_w)
+        print(f"  process_res from engine ({self.opt_h}x{self.opt_w}) -> {self.process_res}")
         self.normalize = T.Compose([
             T.ToTensor(),
             T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
 
-    # ---- 1) preprocessing (exact replica of the official InputProcessor) --- #
+    # ---- 1) preprocessing -------------------------------------------------- #
     def preprocess(self, rgb_image):
         """RGB uint8 (H0,W0,3) -> ((1,3,H,W) blob, meta dict)."""
         orig_h, orig_w = rgb_image.shape[:2]
 
         # (a) boundary resize, preserving aspect ratio
         img = self._boundary_resize(rgb_image, self.process_res, self.process_res_method)
-        # (b) make each dimension divisible by PATCH_SIZE (nearest multiple, via resize)
+        # (b) round each side to a multiple of PATCH_SIZE
         img = self._make_divisible_by_resize(img, PATCH_SIZE)
+        # (c) keep within the engine's [min, max] range
+        img = self._fit_engine_bounds(img)
         proc_h, proc_w = img.shape[:2]
 
         blob = self.normalize(img)[None]  # (1, 3, H, W), float32
 
-        # The aspect-preserving resize uses a single scale = process_res / longest_side,
-        # so focal (fx, fy) scales by the same factor as the longest-side resize.
+        # focal scales by the same single (longest-side) resize factor.
         scale = max(proc_h, proc_w) / float(max(orig_h, orig_w))
         meta = {
             "orig_hw": (orig_h, orig_w),
@@ -172,6 +183,20 @@ class DepthAnythingV3:
         if new_w == w and new_h == h:
             return img
         interp = cv2.INTER_CUBIC if (new_w > w or new_h > h) else cv2.INTER_AREA
+        return cv2.resize(img, (new_w, new_h), interpolation=interp)
+
+    def _fit_engine_bounds(self, img):
+        """Clamp H/W into the engine's [min, max] range. Normally a no-op; only fires
+        for extreme aspect ratios. Bounds are multiples of 14, so output stays so."""
+        h, w = img.shape[:2]
+        new_h = min(max(h, self.min_h), self.max_h)
+        new_w = min(max(w, self.min_w), self.max_w)
+        if (new_h, new_w) == (h, w):
+            return img
+        print(f"  [warn] processed size ({h},{w}) outside engine range "
+              f"H[{self.min_h},{self.max_h}] W[{self.min_w},{self.max_w}]; "
+              f"resizing to ({new_h},{new_w}).")
+        interp = cv2.INTER_CUBIC if (new_h > h or new_w > w) else cv2.INTER_AREA
         return cv2.resize(img, (new_w, new_h), interpolation=interp)
 
     # ---- 2) TensorRT inference -------------------------------------------- #
@@ -222,8 +247,7 @@ class DepthAnythingV3:
 
     def _postprocess_nested(self, out):
         """Nested model: scale metric branch by focal/300, least-squares align to the
-        any-view (giant) depth, then fill the sky. Replicates NestedDepthAnything3Net.
-        """
+        any-view (giant) depth, then fill the sky."""
         depth = out["depth"]          # giant relative depth (H, W)
         conf = out["conf"]            # giant confidence (H, W)
         intr = out["intrinsics"]      # (3, 3)
@@ -260,7 +284,7 @@ class DepthAnythingV3:
 
     @staticmethod
     def _apply_sky(depth, sky, sky_threshold=0.3, max_cap=None):
-        """Set sky pixels to the 99th percentile of non-sky depth (official mono path)."""
+        """Set sky pixels to the 99th percentile of non-sky depth."""
         non_sky = sky < sky_threshold
         if non_sky.sum() <= 10 or (~non_sky).sum() <= 10:
             return depth
@@ -323,10 +347,9 @@ def main():
     parser.add_argument("-mt", "--model-type", required=True,
                         choices=["anyview", "metric", "mono", "nested"],
                         help="model family (must match the exported engine)")
-    parser.add_argument("-pr", "--process-res", type=int, default=504,
-                        help="resize longest side to this (official default 504)")
     parser.add_argument("--process-res-method", default="upper_bound_resize",
-                        choices=["upper_bound_resize", "lower_bound_resize"])
+                        choices=["upper_bound_resize", "lower_bound_resize"],
+                        help="how the longest/shortest side is matched to the engine size")
     parser.add_argument("--focal", type=float, default=None,
                         help="focal length in pixels of the ORIGINAL image (metric model only)")
     parser.add_argument("--save-raw", action="store_true",
@@ -344,7 +367,6 @@ def main():
     pipeline = DepthAnythingV3(
         engine_path=args.trt,
         model_type=args.model_type,
-        process_res=args.process_res,
         process_res_method=args.process_res_method,
         device=args.device,
         focal=args.focal,

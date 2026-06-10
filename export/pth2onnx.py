@@ -1,37 +1,31 @@
 """
 Export a Depth-Anything-3 checkpoint to ONNX (single-view / monocular).
 
-This follows the official Depth-Anything-3 repository
-(https://github.com/ByteDance-Seed/Depth-Anything-3). The exported graph takes a
-single, already pre-processed image tensor ``images`` of shape ``(1, 3, H, W)``
-(ImageNet-normalized, H/W divisible by 14) and returns the *raw* per-pixel network
-predictions. Everything that cannot be expressed cleanly as a static graph
-(sky masking with quantiles, the nested model's least-squares alignment, and the
-metric ``focal * raw / 300`` scaling) is intentionally left out of the engine and
-performed in Python during inference (see ../depth_estimation.py).
+Input ``images`` is (1, 3, H, W), ImageNet-normalized, H/W divisible by 14. The
+graph returns the raw network predictions; post-processing (sky masking, metric
+scaling, nested alignment) runs in Python at inference (see ../depth_estimation.py).
+Exporting a single view (S = 1) skips the multi-view path (gated on S >= 3) and
+keeps the model traceable.
 
-A single-view export (S = 1) is the key simplification that makes the model
-traceable: the multi-view "reference-view selection" inside the DINO backbone is
-gated on ``S >= 3`` and is therefore skipped.
-
-Output tensors depend on the model family:
+Output tensors per family:
     anyview (small/base/large/giant):  depth, conf, intrinsics
     metric  (da3metric-large):         depth, sky
     mono    (da3mono-large):           depth, sky
     nested  (da3nested-giant-large):   depth, conf, intrinsics, metric_depth, sky
 
-IMPORTANT: run this from *inside the Depth-Anything-3 repository* (or with its
-``src`` on PYTHONPATH) so that ``depth_anything_3`` is importable. Point ``-m`` at
-a local snapshot directory of the model (the folder that holds ``config.json`` and
-``model.safetensors``), or at a Hugging Face repo id such as
-``depth-anything/DA3METRIC-LARGE``.
+``depth_anything_3`` must be importable. Pass ``-m`` a local snapshot dir
+(config.json + model.safetensors) or a HF repo id (e.g. depth-anything/DA3METRIC-LARGE).
+
+Models over the 2GB protobuf limit (giant / nested) write weights to a sidecar
+(``<name>.onnx_data``) next to the ``.onnx``; keep the two together.
 
 Example:
     python pth2onnx.py -m depth-anything/DA3METRIC-LARGE -o da3metric_large.onnx \
-        --height 504 --width 504 --check --simplify
+        --res 504 --check
 """
 
 import argparse
+import os
 
 import torch
 import torch.nn as nn
@@ -39,15 +33,30 @@ import torch.nn as nn
 from depth_anything_3.api import DepthAnything3
 
 
-# --------------------------------------------------------------------------- #
+# ONNX export does not support aten::cartesian_prod, so replace it with an
+# equivalent built from meshgrid + stack + reshape (all ONNX-supported).
+def _cartesian_prod(*tensors: torch.Tensor) -> torch.Tensor:
+    if len(tensors) == 1:
+        return tensors[0]
+    grids = torch.meshgrid(*tensors, indexing="ij")
+    return torch.stack([g.reshape(-1) for g in grids], dim=-1)
+
+
+torch.cartesian_prod = _cartesian_prod
+
+
 # Per-family output tensor names. Keep in sync with depth_estimation.py.
-# --------------------------------------------------------------------------- #
 OUTPUT_NAMES = {
     "anyview": ["depth", "conf", "intrinsics"],
     "metric": ["depth", "sky"],
     "mono": ["depth", "sky"],
     "nested": ["depth", "conf", "intrinsics", "metric_depth", "sky"],
 }
+
+
+def needs_external_data(model_name: str, model_type: str) -> bool:
+    """True for giant-backbone models (anyview-giant, nested) that exceed 2GB."""
+    return model_type == "nested" or "giant" in model_name.lower()
 
 
 def infer_model_type(model_name: str) -> str:
@@ -65,9 +74,6 @@ def infer_model_type(model_name: str) -> str:
 def _intrinsics_from_pose_enc(pose_enc: torch.Tensor, H: int, W: int) -> torch.Tensor:
     """Build a (B, S, 3, 3) intrinsics matrix from the camera-decoder pose encoding.
 
-    Mirrors ``pose_encoding_to_extri_intri`` (depth_anything_3.model.utils.transform)
-    but only the intrinsics part, so we avoid the quaternion->matrix branch that we
-    do not need for monocular depth.
     pose_enc layout: [tx, ty, tz, qx, qy, qz, qw, fov_h, fov_w].
     """
     fov_h = pose_enc[..., 7]
@@ -85,15 +91,12 @@ def _intrinsics_from_pose_enc(pose_enc: torch.Tensor, H: int, W: int) -> torch.T
     return intr
 
 
-# --------------------------------------------------------------------------- #
-# Single-view export wrappers. They call the network's components directly,
-# bypassing the non-exportable Python post-processing in the original forward().
-# --------------------------------------------------------------------------- #
+# Single-view export wrappers: call the network components directly, skipping the
+# non-exportable Python post-processing in the original forward().
 def _run_single_net(net, x: torch.Tensor):
-    """Run one DepthAnything3Net (backbone + head [+ cam_dec]) for S = 1.
+    """Run one DepthAnything3Net (backbone + head) for S = 1.
 
-    Returns the raw head output Dict and the per-stage features (so callers can
-    feed ``feats[-1][1]`` to the camera decoder).
+    Returns the raw head output and per-stage features (feed feats[-1][1] to cam_dec).
     """
     H, W = x.shape[-2], x.shape[-1]
     feats, _aux = net.backbone(
@@ -141,11 +144,8 @@ class DPTExport(nn.Module):
 
 
 class NestedExport(nn.Module):
-    """da3nested-giant-large: raw tensors from both branches.
-
-    The metric scaling (focal/300), least-squares alignment to the any-view depth
-    and the sky handling are all done in Python at inference time.
-    """
+    """da3nested-giant-large: raw tensors from both branches (scaling/alignment/sky
+    handling are done in Python at inference time)."""
 
     def __init__(self, net):
         super().__init__()
@@ -184,21 +184,21 @@ def build_export_model(args):
     print(f"Loaded '{da3.model_name}' -> family '{model_type}'")
 
     wrapper = WRAPPERS[model_type](da3.model).eval()
-    return wrapper, model_type
+    return wrapper, model_type, da3.model_name
 
 
 def main(args):
-    model, model_type = build_export_model(args)
+    model, model_type, model_name = build_export_model(args)
 
-    # H/W must be divisible by 14 (DINO patch size).
-    assert args.height % 14 == 0 and args.width % 14 == 0, "height/width must be multiples of 14"
-    data = torch.rand(1, 3, args.height, args.width)
+    # H/W are dynamic, so --res only sizes the trace sample; the real range is set
+    # by onnx2trt's optimization profile.
+    assert args.res % 14 == 0, "res must be a multiple of 14"
+    data = torch.rand(1, 3, args.res, args.res)
 
     with torch.no_grad():
         _ = model(data)  # sanity forward before tracing
 
     output_names = OUTPUT_NAMES[model_type]
-    # H and W are dynamic so the engine can accept aspect-ratio-preserving inputs.
     dynamic_axes = {"images": {2: "H", 3: "W"}}
     for name in output_names:
         if name == "intrinsics":
@@ -206,6 +206,8 @@ def main(args):
         dynamic_axes[name] = {1: "H", 2: "W"}
 
     output_file = args.output or (args.model.rstrip("/").split("/")[-1] + ".onnx")
+
+    large = needs_external_data(model_name, model_type)
 
     torch.onnx.export(
         model,
@@ -218,23 +220,31 @@ def main(args):
         do_constant_folding=True,
         verbose=False,
     )
-    print(f"Exported ONNX -> {output_file}  (outputs: {output_names})")
+
+    if large:
+        import onnx
+
+        # Move weights to a single sidecar next to the .onnx (keeps the proto < 2GB).
+        data_file = os.path.basename(output_file) + "_data"
+        onnx_model = onnx.load(output_file)
+        onnx.save(
+            onnx_model,
+            output_file,
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            location=data_file,
+            size_threshold=1024,
+        )
+        print(f"Exported ONNX -> {output_file} (+ external data {data_file})  (outputs: {output_names})")
+    else:
+        print(f"Exported ONNX -> {output_file}  (outputs: {output_names})")
 
     if args.check:
         import onnx
 
-        onnx.checker.check_model(onnx.load(output_file))
+        # Pass the path (not a loaded model) to handle external data / >2GB.
+        onnx.checker.check_model(output_file)
         print("ONNX check passed.")
-
-    if args.simplify:
-        import onnx
-        import onnxsim
-
-        onnx_model = onnx.load(output_file)
-        onnx_model, ok = onnxsim.simplify(onnx_model)
-        assert ok, "onnxsim simplification failed"
-        onnx.save(onnx_model, output_file)
-        print(f"Simplified ONNX -> {output_file}")
 
 
 if __name__ == "__main__":
@@ -245,9 +255,9 @@ if __name__ == "__main__":
     parser.add_argument("-mt", "--model-type", default=None,
                         choices=["anyview", "metric", "mono", "nested"],
                         help="override the auto-detected model family")
-    parser.add_argument("--height", type=int, default=504, help="sample (opt) height, multiple of 14")
-    parser.add_argument("--width", type=int, default=504, help="sample (opt) width, multiple of 14")
+    parser.add_argument("--res", type=int, default=504,
+                        help="square trace-sample size (multiple of 14); ONNX H/W stay "
+                             "dynamic so this does not constrain the exported model")
     parser.add_argument("--opset", type=int, default=17)
     parser.add_argument("--check", action="store_true", help="validate the exported model")
-    parser.add_argument("--simplify", action="store_true", help="simplify with onnxsim")
     main(parser.parse_args())
