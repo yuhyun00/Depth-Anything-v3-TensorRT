@@ -67,33 +67,31 @@ Run from inside the cloned Depth-Anything-3 repo (so `depth_anything_3` imports)
 ```bash
 # metric model
 python export/pth2onnx.py -m depth-anything/DA3METRIC-LARGE \
-    -o da3metric_large.onnx --height 504 --width 504 --check --simplify
+    -o da3metric_large.onnx --res 504 --check
 
 # any-view (relative) model
-python export/pth2onnx.py -m depth-anything/DA3-LARGE -o da3_large.onnx --simplify
+python export/pth2onnx.py -m depth-anything/DA3-LARGE -o da3_large.onnx
 
 # nested (metric) model
-python export/pth2onnx.py -m depth-anything/DA3NESTED-GIANT-LARGE -o da3_nested.onnx --simplify
+python export/pth2onnx.py -m depth-anything/DA3NESTED-GIANT-LARGE -o da3_nested.onnx
 ```
 
-`--height/--width` only set the *sample/opt* size used during tracing; the engine
-keeps H and W dynamic. Both must be multiples of 14.
+`--res` only sets the square *sample* size used during tracing; the exported graph
+keeps H and W dynamic (the DINO positional-embedding interpolation and 2D RoPE are
+exported dynamically), so it accepts any aspect ratio. `--res` must be a multiple of 14.
 
-> Dynamic-resolution ViT export exercises the DINO positional-embedding
-> interpolation and 2D RoPE. It traces cleanly with a recent PyTorch (≥ 2.1) at
-> `opset 17`. If a particular TensorRT/PyTorch combination struggles with dynamic
-> spatial dims, export and build at a single fixed resolution instead — set
-> `--height/--width` to your target and use equal `--min/--opt/--max` in step 2 —
-> and keep `--process-res` at the longest side of that resolution during inference.
+> Models over the 2GB protobuf limit (giant / nested) write their weights to a
+> sidecar `<name>.onnx_data` next to the `.onnx` — keep the two files together.
 
 ### 2. Convert: onnx → trt
 
-The input has dynamic spatial dims, so pick a `--opt` size matching what you run
-most (usually `process_res × process_res`). All sizes must be multiples of 14.
+Specify only the longest side via `--res`; the engine accepts any H×W with both
+sides in `[14, res]` and is tuned for `(res, res)`. The inference script reads this
+back from the engine, so no input size is passed at run time.
 
 ```bash
 python export/onnx2trt.py --onnx da3metric_large.onnx --saveEngine da3metric_large.engine \
-    --fp16 --min 154 154 --opt 504 504 --max 504 504
+    --fp16 --res 504
 ```
 
 ### 3. Inference
@@ -115,6 +113,9 @@ python depth_estimation.py -i ./images -o ./results \
     --trt da3_nested.engine --model-type nested --save-raw
 ```
 
+There is no input-size flag: the resize target (longest side) is read from the
+engine's optimization profile (set by `onnx2trt --res`).
+
 Outputs per image: a colorized `*_depth.png` (closer = brighter), and, with
 `--save-raw`, a `*_depth.npy` holding the float depth map at the original
 resolution (in metres for metric/nested models).
@@ -127,7 +128,6 @@ resolution (in metres for metric/nested models).
 | `-o, --output` | folder to save results |
 | `-trt, --trt` | path to the TensorRT engine (`.engine`) |
 | `-mt, --model-type` | `anyview / metric / mono / nested` (must match the exported engine) |
-| `-pr, --process-res` | resize the longest side to this (official default 504) |
 | `--process-res-method` | `upper_bound_resize` (longest side) or `lower_bound_resize` (shortest side) |
 | `--focal` | focal length in pixels of the **original** image (metric model only) |
 | `--save-raw` | also save the raw depth map as a `.npy` file |
@@ -144,7 +144,6 @@ from depth_estimation import DepthAnythingV3, visualize_depth
 pipe = DepthAnythingV3(
     engine_path="da3metric_large.engine",
     model_type="metric",
-    process_res=504,
     device="cuda:0",
     focal=1200,            # original-image focal in pixels (metric model)
 )
@@ -161,7 +160,7 @@ cv2.imwrite("result.png", vis)
 
 ### Methods
 
-- `preprocess(rgb_image)` — official `InputProcessor` replica → `((1,3,H,W) blob, meta)`
+- `preprocess(rgb_image)` — resize (size from the engine) + normalize → `((1,3,H,W) blob, meta)`
 - `infer(blob)` — TensorRT inference → dict of numpy output tensors
 - `postprocess(out, meta)` — sky / metric / alignment, resize back to the original
 - `run(rgb_image)` — run all of the above at once
@@ -178,10 +177,9 @@ cv2.imwrite("result.png", vis)
 
 ## Preprocessing
 
-Replicates the official `InputProcessor`: resize the longest side to
-`--process-res` (default 504, aspect preserved, `INTER_CUBIC` up / `INTER_AREA`
-down), round each dimension to the nearest multiple of 14, `ToTensor`, then
-ImageNet normalization (`mean=[0.485,0.456,0.406]`, `std=[0.229,0.224,0.225]`).
+Resize the longest side to the engine size (aspect preserved, `INTER_CUBIC` up /
+`INTER_AREA` down), round each dimension to the nearest multiple of 14, `ToTensor`,
+then ImageNet normalization (`mean=[0.485,0.456,0.406]`, `std=[0.229,0.224,0.225]`).
 
 ## License / Sources
 

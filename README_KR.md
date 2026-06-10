@@ -61,31 +61,29 @@ pip install -e Depth-Anything-3
 ```bash
 # metric 모델
 python export/pth2onnx.py -m depth-anything/DA3METRIC-LARGE \
-    -o da3metric_large.onnx --height 504 --width 504 --check --simplify
+    -o da3metric_large.onnx --res 504 --check
 
 # any-view (상대 깊이) 모델
-python export/pth2onnx.py -m depth-anything/DA3-LARGE -o da3_large.onnx --simplify
+python export/pth2onnx.py -m depth-anything/DA3-LARGE -o da3_large.onnx
 
 # nested (metric) 모델
-python export/pth2onnx.py -m depth-anything/DA3NESTED-GIANT-LARGE -o da3_nested.onnx --simplify
+python export/pth2onnx.py -m depth-anything/DA3NESTED-GIANT-LARGE -o da3_nested.onnx
 ```
 
-`--height/--width`는 트레이싱에 쓰이는 *샘플(opt)* 크기만 정하며, 엔진은 H/W를 동적으로 유지합니다.
-둘 다 14의 배수여야 합니다.
+`--res`는 트레이싱에 쓰이는 정사각 *샘플* 크기만 정하며, 내보낸 그래프는 H/W를 동적으로 유지합니다
+(DINO 위치 임베딩 보간과 2D RoPE도 동적으로 export됨). 따라서 어떤 종횡비든 받습니다. `--res`는 14의 배수여야 합니다.
 
-> 동적 해상도 ViT 내보내기는 DINO 위치 임베딩 보간과 2D RoPE를 거칩니다. 최신 PyTorch(≥ 2.1) +
-> `opset 17`에서 정상적으로 트레이싱됩니다. 특정 TensorRT/PyTorch 조합에서 동적 공간 차원이 문제가
-> 되면, 단일 고정 해상도로 내보내고 빌드하세요 — `--height/--width`를 목표 해상도로 설정하고 2단계에서
-> `--min/--opt/--max`를 동일하게 주면 됩니다. 추론 시 `--process-res`는 그 해상도의 긴 변 길이로 맞추세요.
+> 2GB protobuf 한계를 넘는 모델(giant / nested)은 가중치를 `.onnx` 옆의 `<name>.onnx_data`
+> 사이드카에 저장합니다 — 두 파일을 항상 같은 폴더에 두세요.
 
 ### 2. 변환: onnx → trt
 
-입력은 공간 차원이 동적이므로, 가장 자주 쓰는 크기에 맞춰 `--opt`를 고르세요(보통 `process_res × process_res`).
-모든 크기는 14의 배수여야 합니다.
+긴 변만 `--res`로 지정하면 됩니다. 엔진은 두 변이 `[14, res]`인 모든 H×W를 받고 `(res, res)`에 맞춰 튜닝됩니다.
+추론 스크립트가 이 값을 엔진에서 읽어오므로, 실행 시 입력 크기를 따로 지정하지 않습니다.
 
 ```bash
 python export/onnx2trt.py --onnx da3metric_large.onnx --saveEngine da3metric_large.engine \
-    --fp16 --min 154 154 --opt 504 504 --max 504 504
+    --fp16 --res 504
 ```
 
 ### 3. 추론
@@ -106,6 +104,8 @@ python depth_estimation.py -i ./images -o ./results \
     --trt da3_nested.engine --model-type nested --save-raw
 ```
 
+입력 크기 인자는 없습니다: 리사이즈 목표(긴 변)는 엔진의 optimization profile(`onnx2trt --res`로 설정)에서 읽어옵니다.
+
 이미지당 출력물: 컬러 변환된 `*_depth.png`(가까울수록 밝음), 그리고 `--save-raw` 사용 시
 원본 해상도의 실수형 깊이 맵을 담은 `*_depth.npy`(metric/nested 모델은 미터 단위).
 
@@ -117,7 +117,6 @@ python depth_estimation.py -i ./images -o ./results \
 | `-o, --output` | 결과 저장 폴더 |
 | `-trt, --trt` | TensorRT 엔진(`.engine`) 경로 |
 | `-mt, --model-type` | `anyview / metric / mono / nested` (내보낸 엔진과 일치해야 함) |
-| `-pr, --process-res` | 긴 변을 이 크기로 리사이즈 (공식 기본값 504) |
 | `--process-res-method` | `upper_bound_resize`(긴 변 기준) 또는 `lower_bound_resize`(짧은 변 기준) |
 | `--focal` | **원본** 이미지의 초점거리(픽셀 단위, metric 모델 전용) |
 | `--save-raw` | 원본 깊이 맵을 `.npy`로도 저장 |
@@ -134,7 +133,6 @@ from depth_estimation import DepthAnythingV3, visualize_depth
 pipe = DepthAnythingV3(
     engine_path="da3metric_large.engine",
     model_type="metric",
-    process_res=504,
     device="cuda:0",
     focal=1200,            # 원본 이미지 초점거리(픽셀, metric 모델)
 )
@@ -151,7 +149,7 @@ cv2.imwrite("result.png", vis)
 
 ### 메서드
 
-- `preprocess(rgb_image)` — 공식 `InputProcessor` 동일 구현 → `((1,3,H,W) blob, meta)`
+- `preprocess(rgb_image)` — 리사이즈(크기는 엔진에서 읽음) + 정규화 → `((1,3,H,W) blob, meta)`
 - `infer(blob)` — TensorRT 추론 → numpy 출력 텐서 dict
 - `postprocess(out, meta)` — 하늘 / metric / 정렬 처리 후 원본 크기로 리사이즈
 - `run(rgb_image)` — 위 단계를 한 번에 실행
@@ -166,9 +164,9 @@ cv2.imwrite("result.png", vis)
 
 ## 전처리
 
-공식 `InputProcessor`를 그대로 재현합니다: 긴 변을 `--process-res`(기본 504, 종횡비 유지,
-확대 시 `INTER_CUBIC` / 축소 시 `INTER_AREA`)로 리사이즈 → 각 차원을 14의 가장 가까운 배수로 반올림 →
-`ToTensor` → ImageNet 정규화(`mean=[0.485,0.456,0.406]`, `std=[0.229,0.224,0.225]`).
+긴 변을 엔진 크기(종횡비 유지, 확대 시 `INTER_CUBIC` / 축소 시 `INTER_AREA`)로 리사이즈 →
+각 차원을 14의 가장 가까운 배수로 반올림 → `ToTensor` →
+ImageNet 정규화(`mean=[0.485,0.456,0.406]`, `std=[0.229,0.224,0.225]`).
 
 ## 라이선스 / 출처
 
