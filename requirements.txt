@@ -1,0 +1,20 @@
+# Inference pipeline (depth_estimation.py)
+torch
+torchvision
+numpy
+opencv-python
+pillow
+
+# ONNX export / conversion (export/pth2onnx.py, export/onnx2trt.py)
+onnx
+onnxsim
+
+# Model loading for export (pth2onnx.py imports depth_anything_3)
+#   Install the official repo so `depth_anything_3` is importable:
+#     git clone https://github.com/ByteDance-Seed/Depth-Anything-3
+#     pip install -e Depth-Anything-3
+#   (this pulls huggingface_hub, safetensors, omegaconf, addict, einops, ...)
+
+# NOTE: TensorRT must be installed separately to match your CUDA / platform
+# (e.g. via the NVIDIA pip index or the TensorRT tarball):
+#   pip install tensorrt
