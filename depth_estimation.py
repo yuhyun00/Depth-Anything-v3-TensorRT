@@ -229,9 +229,23 @@ class DepthAnythingV3:
         depth = cv2.resize(depth, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
         if conf is not None:
             conf = cv2.resize(conf, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+
+        # Intrinsics (when the model outputs them) rescaled to the original
+        # resolution, so K pairs with the original-resolution depth map.
+        K = out.get("intrinsics")
+        if K is not None:
+            proc_h, proc_w = meta["proc_hw"]
+            sx, sy = orig_w / float(proc_w), orig_h / float(proc_h)
+            K = np.asarray(K, dtype=np.float64).copy()
+            K[0, 0] *= sx
+            K[0, 2] *= sx
+            K[1, 1] *= sy
+            K[1, 2] *= sy
+
         return {"depth": depth.astype(np.float32),
                 "conf": None if conf is None else conf.astype(np.float32),
-                "is_metric": is_metric}
+                "is_metric": is_metric,
+                "K": K}
 
     def _postprocess_metric(self, out, meta):
         """Standalone metric model: metric_depth = focal * raw / 300, then sky fill."""
